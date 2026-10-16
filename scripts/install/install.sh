@@ -148,10 +148,14 @@ monitor_cargo_build() {
     # Create temporary file for output
     local temp_output=$(mktemp)
 
-    # Run cargo with stderr+stdout merged, tee to temp file
-    # Suppress warnings for clean user-facing output
-    {
-        RUSTFLAGS="-A warnings" cargo build --release 2>&1 | while IFS= read -r line; do
+    # Run cargo with stderr+stdout merged into the temp file (no pipe: a
+    # `cmd | while read` loop runs in a subshell, so ${PIPESTATUS[0]} read
+    # after the loop reports the loop's status (always 0), never cargo's —
+    # a failed build used to pass this gate silently. Stream progress by
+    # tailing the file in the background instead.
+    RUSTFLAGS="-A warnings" cargo build --release >"$temp_output" 2>&1 &
+    local cargo_pid=$!
+    tail -n +1 -f "$temp_output" --pid=$cargo_pid 2>/dev/null | while IFS= read -r line; do
             # Stream output to user
             echo "$line"
 
@@ -180,10 +184,8 @@ monitor_cargo_build() {
             fi
         done
 
-        # Return cargo's exit code
-        echo ${PIPESTATUS[0]}
-    } | tee "$temp_output" | tail -1
-
+    # Cargo's real exit code (waited directly — no pipe subshell in between).
+    wait "$cargo_pid"
     local exit_code=$?
     rm -f "$temp_output"
     return $exit_code
@@ -419,21 +421,29 @@ build_binary() {
     local build_minutes=$((build_duration / 60))
     local build_seconds=$((build_duration % 60))
 
-    # Verify binary exists
-    if [ ! -f "target/release/mnemosyne" ]; then
-        print_error "Binary not found after build"
+    # Verify binary exists. The target dir honors CARGO_TARGET_DIR (a global
+    # ~/.cargo/config.toml `target-dir` moves the whole tree elsewhere), and on
+    # Windows the artifact carries the `.exe` suffix — a fixed
+    # `target/release/mnemosyne` check fails on both.
+    local target_dir="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/release"
+    local binary_name="mnemosyne"
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*|Windows_NT*) binary_name="mnemosyne.exe" ;;
+    esac
+    if [ ! -f "$target_dir/$binary_name" ]; then
+        print_error "Binary not found after build (looked in $target_dir/$binary_name)"
         exit 1
     fi
 
     # Get binary size
-    local binary_size=$(ls -lh target/release/mnemosyne | awk '{print $5}')
+    local binary_size=$(ls -lh "$target_dir/$binary_name" | awk '{print $5}')
 
     # Success summary
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     print_success "Build complete in ${build_minutes}m ${build_seconds}s"
     print_success "Binary size: $binary_size"
-    print_success "Location: target/release/mnemosyne"
+    print_success "Location: $target_dir/$binary_name"
     echo ""
 }
 
