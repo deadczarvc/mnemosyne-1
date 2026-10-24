@@ -151,11 +151,22 @@ monitor_cargo_build() {
     # Run cargo with stderr+stdout merged into the temp file (no pipe: a
     # `cmd | while read` loop runs in a subshell, so ${PIPESTATUS[0]} read
     # after the loop reports the loop's status (always 0), never cargo's —
-    # a failed build used to pass this gate silently. Stream progress by
-    # tailing the file in the background instead.
+    # a failed build used to pass this gate silently.
+    #
+    # Progress streams by polling the file, NOT by `tail -f --pid`: `--pid` is a GNU extension and
+    # BSD tail (macOS) has no such flag, so that form blocks forever on a platform this installer
+    # supports. `tail -c +N` and `wc -c` are POSIX. Cargo's status comes from `wait`, which no
+    # subshell can hide.
     RUSTFLAGS="-A warnings" cargo build --release >"$temp_output" 2>&1 &
     local cargo_pid=$!
-    tail -n +1 -f "$temp_output" --pid=$cargo_pid 2>/dev/null | while IFS= read -r line; do
+    local consumed=0
+    local total=0
+    local streaming=true
+    while :; do
+        total=$(wc -c <"$temp_output" 2>/dev/null | tr -d ' \n')
+        total=${total:-0}
+        if (( total > consumed )); then
+            while IFS= read -r line; do
             # Stream output to user
             echo "$line"
 
@@ -182,13 +193,23 @@ monitor_cargo_build() {
                 local seconds=$((elapsed % 60))
                 echo -e "${GREEN}   ✓ Dependencies complete! Building main binary... (${minutes}m ${seconds}s)${NC}" >&2
             fi
-        done
-
-    # Cargo's real exit code (waited directly — no pipe subshell in between).
-    wait "$cargo_pid"
-    local exit_code=$?
-    rm -f "$temp_output"
-    return $exit_code
+            done < <(tail -c +$((consumed + 1)) "$temp_output")
+            consumed=$total
+        fi
+        # Keep polling while cargo lives; once it is gone, drain whatever it wrote last and stop.
+        if ! kill -0 "$cargo_pid" 2>/dev/null; then
+            wait "$cargo_pid"
+            local exit_code=$?
+            total=$(wc -c <"$temp_output" 2>/dev/null | tr -d ' \n')
+            total=${total:-0}
+            if (( total > consumed )); then
+                tail -c +$((consumed + 1)) "$temp_output"
+            fi
+            rm -f "$temp_output"
+            return $exit_code
+        fi
+        sleep 0.4
+    done
 }
 
 # Show build error with specific fix instructions
